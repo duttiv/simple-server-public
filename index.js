@@ -2,16 +2,33 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const mariadb = require('mariadb');
+const { uniqueUsernameGenerator, adjectives, nouns } = require("unique-username-generator");
+const crypto = require('crypto');
+
+const sha256 = (inputString) => {
+  const hash = crypto.createHash('sha256');
+  hash.update(inputString);
+  return hash.digest('hex');
+}
+
+const capitalizeFirstLetter = (string) => {
+  return string.charAt(0).toUpperCase() + string.slice(1);
+}
 
 const app = express();
 
 const port = 8080;
 
+const host = "changeme";
+const database = "changeme";
+const user = "changeme";
+const password = "changeme";
+
 const pool = mariadb.createPool({
-  host: "localhost",
-  database: "simple",
-  user: "simple",
-  password: "S1mpl3P4ssw0rd!",
+  host,
+  database,
+  user,
+  password,
   connectionLimit: 5,
   insertIdAsNumber: true,
   supportBigNumbers: true,
@@ -76,14 +93,14 @@ app.get('/api/processes', withErrorHandling(async (req, res) => {
 
 app.get('/api/data-types', withErrorHandling(async (req, res) => {
   const response = await connectDatabase(async (connection) => {
-    return await connection.query("SELECT id, name FROM data_type;");
+    return await connection.query("SELECT id, name, description FROM data_type;");
   });
   res.send(response);
 }));
 
 app.get('/api/quality-criteria', withErrorHandling(async (req, res) => {
   const response = await connectDatabase(async (connection) => {
-    return await connection.query("SELECT id, name FROM quality_criteria;");
+    return await connection.query("SELECT id, name, description, guidelines FROM quality_criteria;");
   });
   res.send(response);
 }));
@@ -99,6 +116,44 @@ app.get('/api/evaluation-period', withErrorHandling(async (req, res) => {
   res.send(response);
 }));
 
+app.get('/api/user', withErrorHandling(async (req, res) => {
+  const { evaluationId } = req.query;
+  const response = await connectDatabase(async (connection) => {
+    return await connection.query(
+      `SELECT user.id, user.email, user.first_name as firstName, user.last_name as lastName
+       FROM user
+                INNER JOIN evaluation on evaluation.fk_user = user.id
+       WHERE evaluation.id = ${evaluationId}`);
+  });
+  res.send(response);
+}));
+
+app.post('/api/evaluation', withErrorHandling(async (req, res) => {
+  const result = await connectDatabase(async (connection) => {
+    const username = uniqueUsernameGenerator({
+      separator: '.',
+      dictionaries: [adjectives, nouns]
+    });
+    const email = `${username}${Math.floor(Math.random() * 1000)}@test.net`;
+    const split = username.split('.');
+    const firstName = capitalizeFirstLetter(split[0]);
+    const lastName = capitalizeFirstLetter(split[1]);
+    const newUser = await connection.query(
+      `INSERT INTO user (email, password, first_name, last_name)
+       VALUES ('${email}', '${sha256(username)}', '${firstName}', '${lastName}')`);
+    const userId = newUser.insertId;
+    connection.query(
+      `INSERT INTO user_department (fk_user, fk_department)
+       VALUES ('${userId}', '${Math.floor(Math.random() * 4) + 1}')`);
+    const evalPeriodId = await connection.query(
+      'SELECT id FROM evaluation_period ORDER BY id DESC LIMIT 1');
+    const id = evalPeriodId[0].id;
+    return await connection.query(`INSERT INTO evaluation (fk_period, fk_user)
+                                   VALUES (${id}, ${userId})`);
+  });
+  res.send({ id: result.insertId });
+}));
+
 app.get('/api/evaluation/stakeholders', withErrorHandling(async (req, res) => {
   const { evaluationPeriodId } = req.query;
   const result = await connectDatabase(async (connection) => {
@@ -108,7 +163,6 @@ app.get('/api/evaluation/stakeholders', withErrorHandling(async (req, res) => {
   });
   res.send(result.map((evaluation) => evaluation.fk_user));
 }));
-
 
 app.post('/api/evaluation/stakeholders', withErrorHandling(async (req, res) => {
   const { evaluationPeriodId, users } = req.body;
@@ -177,7 +231,7 @@ app.post('/api/evaluation/data-types', withErrorHandling(async (req, res) => {
 app.get('/api/evaluation/scores/data-types', withErrorHandling(async (req, res) => {
   const { evaluationId } = req.query;
   const response = await connectDatabase(async (connection) => {
-    return await connection.query(`SELECT dt.id, dt.name, count(dt.id) as count
+    return await connection.query(`SELECT dt.id, dt.name, dt.description, count(dt.id) as count
                                    from data_type dt
                                             JOIN evaluation_process_data_type epdt
                                                  on dt.id = epdt.fk_data_type
@@ -325,10 +379,14 @@ app.get('/api/evaluation/actions', withErrorHandling(withErrorHandling(async (re
 
 app.post('/api/evaluation/actions', withErrorHandling(async (req, res) => {
   const { evaluationPeriodId, actions } = req.body;
-  const values = actions.map((action) => [action.activity, evaluationPeriodId, action.userId]);
+  const values = actions.map(action => [action.activity, evaluationPeriodId, action.userId]);
+
+  // Create a string for the placeholders - each set of values in the array needs a tuple placeholder
+  const placeholders = values.map(() => '(?, ?, ?)').join(', ');
+
   await connectDatabase(async (connection) => {
     await connection.query(`INSERT INTO evaluation_action (activity, fk_period, fk_user)
-                            VALUES ?`, [values]);
+                            VALUES ${placeholders}`, [].concat(...values));
   });
   res.send();
 }));
